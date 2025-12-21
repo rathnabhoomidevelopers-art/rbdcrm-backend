@@ -117,7 +117,7 @@ app.get("/health", (req, res) => {
 });
 
 /* ======================================================
-   ✅ ROUND ROBIN HELPERS (NEW)
+   ✅ ROUND ROBIN HELPERS
    Uses settings collection doc:
    { "_id": "rr_lead_assign", "lastIndex": 0 }
 ====================================================== */
@@ -158,6 +158,11 @@ async function pickRoundRobinUser_(settingsCol, usersCol) {
   return pickedUser;
 }
 
+/**
+ * ✅ UPDATED:
+ * - Treat null/""/"   " as unassigned
+ * - Normalize existing Assigned_to to lowercase trimmed
+ */
 async function assignRoundRobinToLeads_(leads, settingsCol, usersCol) {
   const users = await getActiveUsers_(usersCol);
   if (!users.length) return leads;
@@ -168,10 +173,15 @@ async function assignRoundRobinToLeads_(leads, settingsCol, usersCol) {
   let idx = lastIndex % users.length;
 
   for (const l of leads) {
-    // only assign if Assigned_to is empty
-    if (!l.Assigned_to) {
+    const current = (l.Assigned_to || "").toString().trim();
+
+    // only assign if Assigned_to is empty/blank
+    if (!current) {
       l.Assigned_to = users[idx];
       idx = (idx + 1) % users.length;
+    } else {
+      // normalize
+      l.Assigned_to = current.toLowerCase();
     }
   }
 
@@ -366,6 +376,11 @@ app.get("/users", auth(["admin", "user"]), async (req, res) => {
    LEADS
 ========================= */
 
+/**
+ * ✅ UPDATED:
+ * - If admin calls GET /leads, auto-assign any existing unassigned leads (Assigned_to null/""/missing)
+ * - This fixes leads inserted directly via Mongo/n8n/Google Sheet that bypass /add-lead endpoints.
+ */
 app.get("/leads", auth(["admin", "user"]), async (req, res) => {
   let clientObj;
   try {
@@ -373,6 +388,47 @@ app.get("/leads", auth(["admin", "user"]), async (req, res) => {
     const database = clientObj.db("crm");
     const collection = database.collection("leads");
 
+    // ✅ Admin backfill auto-assign for any unassigned leads
+    if (req.user.role === "admin") {
+      const settingsCol = database.collection("settings");
+      const usersCol = database.collection("users");
+
+      // Get unassigned lead IDs
+      const unassigned = await collection
+        .find(
+          {
+            $or: [
+              { Assigned_to: null },
+              { Assigned_to: "" },
+              { Assigned_to: { $exists: false } },
+            ],
+          },
+          { projection: { _id: 1, Assigned_to: 1 } }
+        )
+        .sort({ createdAt: 1 })
+        .toArray();
+
+      if (unassigned.length) {
+        // build temp objects for RR helper
+        const temp = unassigned.map((x) => ({
+          _id: x._id,
+          Assigned_to: x.Assigned_to,
+        }));
+
+        await assignRoundRobinToLeads_(temp, settingsCol, usersCol);
+
+        // persist to DB
+        const bulk = collection.initializeUnorderedBulkOp();
+        for (const t of temp) {
+          bulk.find({ _id: t._id }).updateOne({
+            $set: { Assigned_to: t.Assigned_to, assignedAt: new Date() },
+          });
+        }
+        await bulk.execute();
+      }
+    }
+
+    // Normal query behavior
     let query = {};
     if (req.user.role === "user" && req.user.user_name) {
       const normalized = req.user.user_name.toString().trim().toLowerCase();
@@ -422,7 +478,8 @@ app.get("/lead/:id", auth(["admin", "user"]), async (req, res) => {
  */
 app.post("/add-lead", auth(["admin", "user"]), async (req, res) => {
   const mobile = (req.body.mobile || "").toString().trim();
-  if (!mobile) return res.status(400).json({ message: "Mobile number is required" });
+  if (!mobile)
+    return res.status(400).json({ message: "Mobile number is required" });
 
   // Mobile normalize/validate
   let digits = mobile.replace(/\D/g, "");
@@ -430,14 +487,16 @@ app.post("/add-lead", auth(["admin", "user"]), async (req, res) => {
   if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
 
   if (digits.length !== 10 || !/^[6-9]\d{9}$/.test(digits)) {
-    return res
-      .status(400)
-      .json({ message: "Enter a valid 10-digit mobile number starting with 6-9" });
+    return res.status(400).json({
+      message: "Enter a valid 10-digit mobile number starting with 6-9",
+    });
   }
 
+  // ✅ UPDATED: treat spaces as empty
   let assignedTo = req.body.Assigned_to
     ? req.body.Assigned_to.toString().trim().toLowerCase()
     : null;
+  if (assignedTo && !assignedTo.trim()) assignedTo = null;
 
   let clientObj;
   try {
@@ -452,7 +511,8 @@ app.post("/add-lead", auth(["admin", "user"]), async (req, res) => {
     if (existing) {
       return res.status(409).json({
         message: "Lead with this mobile number already exists",
-        lead_id: existing.lead_id || (existing._id ? existing._id.toString() : null),
+        lead_id:
+          existing.lead_id || (existing._id ? existing._id.toString() : null),
       });
     }
 
@@ -529,18 +589,27 @@ app.post("/add-leads-bulk", auth(["admin", "user"]), async (req, res) => {
   const items = Array.isArray(req.body?.leads) ? req.body.leads : [];
 
   if (!items.length) {
-    return res.status(400).json({ message: "No leads provided. Send { leads: [...] }" });
+    return res.status(400).json({
+      message: "No leads provided. Send { leads: [...] }",
+    });
   }
 
   const normalizeMobile = (raw) => {
-    if (raw === undefined || raw === null) return { ok: false, digits: "", error: "Mobile missing" };
+    if (raw === undefined || raw === null)
+      return { ok: false, digits: "", error: "Mobile missing" };
 
     let digits = raw.toString().replace(/\D/g, "");
     if (digits.length === 12 && digits.startsWith("91")) digits = digits.slice(2);
     if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
 
-    if (digits.length !== 10) return { ok: false, digits, error: "Mobile must be 10 digits" };
-    if (!/^[6-9]\d{9}$/.test(digits)) return { ok: false, digits, error: "Mobile must start with 6-9" };
+    if (digits.length !== 10)
+      return { ok: false, digits, error: "Mobile must be 10 digits" };
+    if (!/^[6-9]\d{9}$/.test(digits))
+      return {
+        ok: false,
+        digits,
+        error: "Mobile must start with 6-9",
+      };
     return { ok: true, digits, error: null };
   };
 
@@ -571,7 +640,11 @@ app.post("/add-leads-bulk", auth(["admin", "user"]), async (req, res) => {
       }
 
       if (seenInFile.has(nm.digits)) {
-        invalid.push({ row: i + 1, mobile: nm.digits, reason: "Duplicate mobile in uploaded file" });
+        invalid.push({
+          row: i + 1,
+          mobile: nm.digits,
+          reason: "Duplicate mobile in uploaded file",
+        });
         continue;
       }
       seenInFile.add(nm.digits);
@@ -580,11 +653,13 @@ app.post("/add-leads-bulk", auth(["admin", "user"]), async (req, res) => {
         ? row.Assigned_to.toString().trim().toLowerCase()
         : null;
 
+      // ✅ UPDATED: treat spaces as empty
+      if (assignedTo && !assignedTo.trim()) assignedTo = null;
+
       // user upload -> self if missing
       if (!assignedTo && isUser && currentUser) assignedTo = currentUser;
 
       // admin upload -> keep blank for now; we will assign RR in one pass after dedupe
-      // (so RR index moves only for actually inserted leads)
       if (!assignedTo && isAdmin) assignedTo = null;
 
       let dob = row.dob ? new Date(row.dob) : null;
@@ -630,7 +705,9 @@ app.post("/add-leads-bulk", auth(["admin", "user"]), async (req, res) => {
     const existingDocs = await leadsCol
       .find({ mobile: { $in: mobiles } }, { projection: { mobile: 1 } })
       .toArray();
-    const existingSet = new Set(existingDocs.map((d) => (d.mobile || "").toString()));
+    const existingSet = new Set(
+      existingDocs.map((d) => (d.mobile || "").toString())
+    );
 
     const toInsert = [];
     const skippedExisting = [];
@@ -738,10 +815,7 @@ app.put("/edit-lead/:id", auth(["admin", "user"]), async (req, res) => {
     if (!existingLead) return res.status(404).json({ message: "Lead not found" });
 
     const newStatus = update.status;
-    const isTrackedStatus = !!(newStatus && TRACKED_STATUSES.includes(newStatus));
-
     const currentUser = (req.user?.user_name || "").toString().trim().toLowerCase();
-
     const responseData = { message: "Lead updated successfully" };
 
     // Helper: choose least-loaded user excluding current user
@@ -797,8 +871,7 @@ app.put("/edit-lead/:id", auth(["admin", "user"]), async (req, res) => {
       (newStatus === "Busy" || newStatus === "NR/SF" || newStatus === "RNR");
 
     if (shouldTransferCheck) {
-      // Important: "3 days" behavior is implemented as "3 consecutive follow-ups with same status"
-      // because you are saving follow-up entries per update, and sorting by date.
+      // "3 days" behavior implemented as "3 consecutive follow-ups with same status"
       const history = await followUpsCol
         .find({ followup_id: existingLead.lead_id, status: newStatus })
         .sort({ date: -1 })
@@ -848,7 +921,10 @@ app.put("/edit-lead/:id", auth(["admin", "user"]), async (req, res) => {
 
       await followUpsCol.updateOne(
         { followup_id: followupId },
-        { $set: fuUpdate, $setOnInsert: { followup_id: followupId, createdAt: new Date() } },
+        {
+          $set: fuUpdate,
+          $setOnInsert: { followup_id: followupId, createdAt: new Date() },
+        },
         { upsert: true }
       );
     }
@@ -878,7 +954,7 @@ app.delete("/delete-lead/:id", auth(["admin"]), async (req, res) => {
 
     return res.status(200).json({ message: "Deleted successfully" });
   } catch (err) {
-    console.error("Delete lead error", err);
+    console.error("Delete lead error:", err);
     return res.status(500).json({ message: "Internal Server Error" });
   } finally {
     if (clientObj) await clientObj.close();
@@ -915,7 +991,7 @@ app.post("/statuslist", auth(["admin"]), async (req, res) => {
     await database.collection("status").insertOne(status);
     return res.status(201).send();
   } catch (err) {
-    console.error("Status update error", err);
+    console.error("Status update error:", err);
     return res.status(500).json({ message: "Internal Server Error" });
   } finally {
     if (clientObj) await clientObj.close();
@@ -1005,7 +1081,7 @@ app.put("/edit-follow_up/:id", auth(["admin", "user"]), async (req, res) => {
 
     return res.status(200).json({ message: "Follow-up updated successfully" });
   } catch (err) {
-    console.error("Update follow-up error", err);
+    console.error("Update follow-up error:", err);
     return res.status(500).json({ message: "Internal Server Error" });
   } finally {
     if (clientObj) await clientObj.close();
@@ -1034,7 +1110,9 @@ app.get("/follow-up/:id", auth(["admin", "user"]), async (req, res) => {
   try {
     clientObj = await mongoClient.connect(connectionString);
     const database = clientObj.db("crm");
-    const doc = await database.collection("follow-ups").findOne({ followup_id: id });
+    const doc = await database
+      .collection("follow-ups")
+      .findOne({ followup_id: id });
 
     if (!doc) return res.status(404).json({ message: "Follow-up not found" });
     return res.status(200).json(doc);
@@ -1054,7 +1132,9 @@ app.delete("/delete-follow_up/:id", auth(["admin"]), async (req, res) => {
     clientObj = await mongoClient.connect(connectionString);
     const database = clientObj.db("crm");
 
-    const result = await database.collection("follow-ups").deleteOne({ followup_id: id });
+    const result = await database
+      .collection("follow-ups")
+      .deleteOne({ followup_id: id });
     if (result.deletedCount === 0) {
       return res.status(404).json({ message: "Follow-up not found" });
     }
@@ -1077,7 +1157,9 @@ app.post("/site_visit", auth(["admin", "user"]), async (req, res) => {
     visit_id: req.body.visit_id,
     name: req.body.name,
     mobile: req.body.mobile ? parseInt(req.body.mobile, 10) : null,
-    site_visit_date: req.body.site_visit_date ? new Date(req.body.site_visit_date) : null,
+    site_visit_date: req.body.site_visit_date
+      ? new Date(req.body.site_visit_date)
+      : null,
     Assigned_to: req.body.Assigned_to,
     created_by: req.body.created_by,
   };
@@ -1087,7 +1169,9 @@ app.post("/site_visit", auth(["admin", "user"]), async (req, res) => {
     clientObj = await mongoClient.connect(connectionString);
     const database = clientObj.db("crm");
     await database.collection("site_visit").insertOne(visit);
-    return res.status(201).json({ message: "Site visit added successfully" });
+    return res
+      .status(201)
+      .json({ message: "Site visit added successfully" });
   } catch (err) {
     console.error("Site visit add error", err);
     return res.status(500).json({ message: "Internal Server Error" });
@@ -1103,7 +1187,9 @@ app.put("/edit_site_visit/:id", auth(["admin", "user"]), async (req, res) => {
     visit_id: req.body.visit_id,
     name: req.body.name,
     mobile: req.body.mobile ? parseInt(req.body.mobile, 10) : null,
-    site_visit_date: req.body.site_visit_date ? new Date(req.body.site_visit_date) : null,
+    site_visit_date: req.body.site_visit_date
+      ? new Date(req.body.site_visit_date)
+      : null,
     Assigned_to: req.body.Assigned_to,
     created_by: req.body.created_by,
   };
@@ -1113,7 +1199,9 @@ app.put("/edit_site_visit/:id", auth(["admin", "user"]), async (req, res) => {
     clientObj = await mongoClient.connect(connectionString);
     const database = clientObj.db("crm");
 
-    await database.collection("site_visit").updateOne({ visit_id: id }, { $set: visit });
+    await database
+      .collection("site_visit")
+      .updateOne({ visit_id: id }, { $set: visit });
     return res.status(200).json({ message: "Site visit updated" });
   } catch (err) {
     console.error("Site visit update error", err);
@@ -1146,7 +1234,9 @@ app.get("/site_visits/:id", auth(["admin", "user"]), async (req, res) => {
     clientObj = await mongoClient.connect(connectionString);
     const database = clientObj.db("crm");
 
-    const doc = await database.collection("site_visit").findOne({ visit_id: id });
+    const doc = await database
+      .collection("site_visit")
+      .findOne({ visit_id: id });
     if (!doc) return res.status(404).json({ message: "Site visit not found" });
 
     return res.status(200).json(doc);
@@ -1166,7 +1256,9 @@ app.delete("/delete/site_visit/:id", auth(["admin"]), async (req, res) => {
     clientObj = await mongoClient.connect(connectionString);
     const database = clientObj.db("crm");
 
-    const result = await database.collection("site_visit").deleteOne({ visit_id: id });
+    const result = await database
+      .collection("site_visit")
+      .deleteOne({ visit_id: id });
     if (result.deletedCount === 0) {
       return res.status(404).json({ message: "Site visit not found" });
     }
