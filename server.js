@@ -31,6 +31,9 @@ const TRACKED_STATUSES = [
   "Closed",
 ];
 
+// ✅ Statuses that should auto-set dob to tomorrow 9AM if dob missing/invalid
+const AUTO_24H_STATUSES = ["NR/SF", "RNR", "Details_shared", "Site Visited", "Busy"];
+
 const allowedOrigins = new Set([
   "https://www.rbdcrm.com",
   "https://rbdcrm.com",
@@ -475,6 +478,9 @@ app.get("/lead/:id", auth(["admin", "user"]), async (req, res) => {
  * ✅ /add-lead
  * - If admin adds a lead without Assigned_to -> Round Robin assign
  * - If user adds a lead without Assigned_to -> assign to self (existing behavior)
+ *
+ * ✅ UPDATED (your requirement):
+ * - Create follow-up ONLY if BOTH status + remarks are present (non-empty) AND status is TRACKED
  */
 app.post("/add-lead", auth(["admin", "user"]), async (req, res) => {
   const mobile = (req.body.mobile || "").toString().trim();
@@ -497,6 +503,10 @@ app.post("/add-lead", auth(["admin", "user"]), async (req, res) => {
     ? req.body.Assigned_to.toString().trim().toLowerCase()
     : null;
   if (assignedTo && !assignedTo.trim()) assignedTo = null;
+
+  // ✅ Normalize status + remarks
+  const status = req.body.status ? req.body.status.toString().trim() : null;
+  const remarks = req.body.remarks ? req.body.remarks.toString().trim() : null;
 
   let clientObj;
   try {
@@ -527,9 +537,19 @@ app.post("/add-lead", auth(["admin", "user"]), async (req, res) => {
       }
     }
 
-    // Busy default date = tomorrow 9AM
+    // ✅ dob rules:
+    // - Visit Scheduled requires dob
+    // - AUTO_24H_STATUSES => tomorrow 9AM if dob missing/invalid
     let dob = req.body.dob ? new Date(req.body.dob) : null;
-    if (req.body.status === "Busy" && !dob) {
+    if (dob && Number.isNaN(dob.getTime())) dob = null;
+
+    if (status === "Visit Scheduled" && !dob) {
+      return res.status(400).json({
+        message: "Visit Scheduled requires a valid dob/date",
+      });
+    }
+
+    if (AUTO_24H_STATUSES.includes(status) && !dob) {
       const tomorrow = new Date();
       tomorrow.setDate(tomorrow.getDate() + 1);
       tomorrow.setHours(9, 0, 0, 0);
@@ -541,11 +561,11 @@ app.post("/add-lead", auth(["admin", "user"]), async (req, res) => {
       name: req.body.name || null,
       mobile: digits,
       source: req.body.source || null,
-      status: req.body.status || null,
+      status: status || null,
       job_role: req.body.job_role || null,
       budget: req.body.budget || null,
       project: req.body.project || null,
-      remarks: req.body.remarks || null,
+      remarks: remarks || null,
       dob: dob,
       Assigned_to: assignedTo || null,
       createdAt: new Date(),
@@ -557,7 +577,9 @@ app.post("/add-lead", auth(["admin", "user"]), async (req, res) => {
 
     await leadsCol.insertOne(lead);
 
-    if (lead.status && TRACKED_STATUSES.includes(lead.status)) {
+    // ✅ FOLLOW-UP CREATION RULE (UPDATED):
+    // Create follow-up ONLY if status is tracked AND remarks is present (non-empty)
+    if (lead.status && TRACKED_STATUSES.includes(lead.status) && lead.remarks) {
       const followUpDate = lead.dob || new Date();
       const follow_up = {
         followup_id: lead.lead_id,
@@ -585,6 +607,14 @@ app.post("/add-lead", auth(["admin", "user"]), async (req, res) => {
 });
 
 // ✅ BULK ADD LEADS (FAST) + Round Robin for admin uploads
+/**
+ * ✅ UPDATED (your requirement):
+ * - Skip existing mobile numbers (already done)
+ * - Create follow-up ONLY if BOTH status + remarks are present (non-empty) AND status is TRACKED
+ * - AUTO_24H_STATUSES => tomorrow 9AM if dob missing/invalid
+ * - Visit Scheduled requires dob (invalid row if missing)
+ * - Trim status/remarks to avoid "   " getting treated as valid
+ */
 app.post("/add-leads-bulk", auth(["admin", "user"]), async (req, res) => {
   const items = Array.isArray(req.body?.leads) ? req.body.leads : [];
 
@@ -662,25 +692,40 @@ app.post("/add-leads-bulk", auth(["admin", "user"]), async (req, res) => {
       // admin upload -> keep blank for now; we will assign RR in one pass after dedupe
       if (!assignedTo && isAdmin) assignedTo = null;
 
+      // ✅ Normalize status + remarks (trim)
+      const status = row.status ? row.status.toString().trim() : null;
+      const remarks = row.remarks ? row.remarks.toString().trim() : null;
+
+      // ✅ dob rules
       let dob = row.dob ? new Date(row.dob) : null;
-      if (row.status === "Busy" && (!dob || Number.isNaN(dob.getTime()))) {
+      if (dob && Number.isNaN(dob.getTime())) dob = null;
+
+      if (status === "Visit Scheduled" && !dob) {
+        invalid.push({
+          row: i + 1,
+          mobile: nm.digits,
+          reason: "Visit Scheduled requires valid dob/date",
+        });
+        continue;
+      }
+
+      if (AUTO_24H_STATUSES.includes(status) && !dob) {
         const tomorrow = new Date();
         tomorrow.setDate(tomorrow.getDate() + 1);
         tomorrow.setHours(9, 0, 0, 0);
         dob = tomorrow;
       }
-      if (dob && Number.isNaN(dob.getTime())) dob = null;
 
       valid.push({
         lead_id: new ObjectId().toHexString(),
         name: row.name || null,
         mobile: nm.digits,
         source: row.source || null,
-        status: row.status || null,
+        status: status || null,
         job_role: row.job_role || null,
         budget: row.budget || null,
         project: row.project || null,
-        remarks: row.remarks || null,
+        remarks: remarks || null,
         dob: dob,
         Assigned_to: assignedTo,
         createdAt: new Date(),
@@ -734,9 +779,14 @@ app.post("/add-leads-bulk", auth(["admin", "user"]), async (req, res) => {
 
     const insertRes = await leadsCol.insertMany(toInsert, { ordered: false });
 
-    // Follow-ups bulk
+    // ✅ Follow-ups bulk (UPDATED RULE):
+    // Create follow-up ONLY if status tracked AND remarks non-empty
     const followUps = toInsert
-      .filter((l) => l.status && TRACKED_STATUSES.includes(l.status))
+      .filter((l) => {
+        const st = (l.status || "").toString().trim();
+        const rm = (l.remarks || "").toString().trim();
+        return st && rm && TRACKED_STATUSES.includes(st);
+      })
       .map((l) => ({
         followup_id: l.lead_id,
         date: l.dob || new Date(),
@@ -778,6 +828,11 @@ app.post("/add-leads-bulk", auth(["admin", "user"]), async (req, res) => {
  * - Busy: sets tomorrow 9AM if date not given
  * - 3 consecutive Busy/NR-SF/RNR => transfer to another user + verification_call=true
  * - when verification_call lead updated to non-Busy => return to original_assigned
+ *
+ * ✅ UPDATED:
+ * - Trim status/remarks when updating
+ * - AUTO_24H_STATUSES => tomorrow 9AM if dob missing AND status is in list
+ * - Visit Scheduled requires dob (reject if missing)
  */
 app.put("/edit-lead/:id", auth(["admin", "user"]), async (req, res) => {
   const leadId = req.params.id;
@@ -785,11 +840,20 @@ app.put("/edit-lead/:id", auth(["admin", "user"]), async (req, res) => {
   const update = {};
   if ("name" in req.body) update.name = req.body.name || null;
   if ("source" in req.body) update.source = req.body.source || null;
-  if ("status" in req.body) update.status = req.body.status || null;
+
+  if ("status" in req.body) {
+    const st = req.body.status ? req.body.status.toString().trim() : null;
+    update.status = st || null;
+  }
+
   if ("job_role" in req.body) update.job_role = req.body.job_role || null;
   if ("budget" in req.body) update.budget = req.body.budget || null;
   if ("project" in req.body) update.project = req.body.project || null;
-  if ("remarks" in req.body) update.remarks = req.body.remarks || null;
+
+  if ("remarks" in req.body) {
+    const rm = req.body.remarks ? req.body.remarks.toString().trim() : null;
+    update.remarks = rm || null;
+  }
 
   if ("dob" in req.body) update.dob = req.body.dob ? new Date(req.body.dob) : null;
 
@@ -840,9 +904,29 @@ app.put("/edit-lead/:id", auth(["admin", "user"]), async (req, res) => {
       return userLeadCounts[0].user;
     }
 
-    // ✅ If status is Busy and date not provided => tomorrow 9AM
-    if (newStatus === "Busy") {
-      if (!("dob" in update) || !update.dob) {
+    // ✅ Normalize dob if provided
+    if ("dob" in update && update.dob && Number.isNaN(update.dob.getTime())) {
+      update.dob = null;
+    }
+
+    // ✅ Visit Scheduled requires date (dob)
+    if (newStatus === "Visit Scheduled") {
+      const nextDob =
+        "dob" in update ? update.dob : existingLead.dob ? new Date(existingLead.dob) : null;
+
+      if (!nextDob) {
+        return res.status(400).json({
+          message: "Visit Scheduled requires a valid dob/date",
+        });
+      }
+    }
+
+    // ✅ AUTO_24H_STATUSES => tomorrow 9AM if dob missing
+    if (newStatus && AUTO_24H_STATUSES.includes(newStatus)) {
+      const nextDob =
+        "dob" in update ? update.dob : existingLead.dob ? new Date(existingLead.dob) : null;
+
+      if (!nextDob) {
         const tomorrow = new Date();
         tomorrow.setDate(tomorrow.getDate() + 1);
         tomorrow.setHours(9, 0, 0, 0);
@@ -902,9 +986,12 @@ app.put("/edit-lead/:id", auth(["admin", "user"]), async (req, res) => {
     const nextStatus = nextLead.status || null;
 
     const isTracked = !!(nextStatus && TRACKED_STATUSES.includes(nextStatus));
+    const hasRemarks = !!((nextLead.remarks || "").toString().trim());
 
-    // Follow-up sync:
-    if (!isTracked) {
+    // ✅ Follow-up sync (UPDATED RULE):
+    // - If NOT tracked OR NO remarks => remove follow-up
+    // - Else upsert follow-up
+    if (!isTracked || !hasRemarks) {
       await followUpsCol.deleteOne({ followup_id: followupId });
     } else {
       const fuUpdate = {
